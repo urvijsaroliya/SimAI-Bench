@@ -104,3 +104,45 @@ class DaosServerConfig(ServerConfig):
     server_address: str = "/path/to/dfuse/mount"
     mode: Literal["posix", "kv"] = "posix"
     nshards: int = 64
+
+@server_registry.register("mpi")
+class MPIServerConfig(ServerConfig):
+    """Direct point-to-point MPI. No server; the communicator is the transport."""
+    type: Literal["mpi"] = "mpi"
+    server_address: str = "comm-world" # unused; base class requires it
+    
+    # With a store, senders don't need to know who reads; with direct sends, they must.
+    consumers: List[int] = Field(default_factory=list)
+    
+    # A receiver must have a buffer ready before data arrives, 
+    # so sizes can't be discovered on the fly like store-mediated scenarios. 
+    # shape is the default size; shapes lets specific message types override it.
+    shape: List[int] = Field(default_factory=lambda: [319488]) 
+    shapes: Dict[str, List[int]] = Field(default_factory=dict)
+    dtype: str = "float32"
+
+    # Keys with these prefixes are sent as raw array bytes (no serialization, GPU-direct if enabled)
+    # into the pre-posted buffers above; everything else is pickled per message.
+    # Raw needs known sizes – fits large fixed-size simulation data, not small variable control messages.
+    bulk_prefixes: List[str] = Field(default_factory=lambda: ["input"])
+    
+    # When the send window fills, default is to block (backpressure).
+    # max_outstanding: how far a producer may run ahead of consumers before blocking.
+    # drop_prefixes keys instead drop the oldest unsent – newest-wins,
+    # for payloads where only the latest matters (e.g., weights).
+    # drop_max_outstanding: own window depth for these; 0 = share.
+    max_outstanding: int = 8 
+    drop_prefixes: List[str] = Field(default_factory=list)
+    drop_max_outstanding: int = 0
+    # 0-based field of the key holding the producer rank (keys are
+    # <prefix>_<rank>_...); point-to-point has no directory to look it up in
+    key_rank_field: int = 1
+    # seconds a producer may stall on a full send window before warning
+    stall_warn_s: float = 30.0
+    # collective wire-format check at setup; requires every rank to build
+    # the datastore the same number of times, so it is off by default
+    verify_peers: bool = False
+    # seconds clean() waits for in-flight sends before cancelling them
+    clean_drain_s: float = 5.0
+    
+    device: Literal["cpu", "cuda"] = "cpu" # cuda keeps payloads in HBM (needs CUDA-aware MPI)
