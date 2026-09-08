@@ -53,6 +53,7 @@ from .filesystem import DataStoreFilesystem, ServerManagerFilesystem
 from .redis import DataStoreRedis, ServerManagerRedis
 from .dragon import DataStoreDragon, ServerManagerDragon
 from .daos import DataStoreDaos, ServerManagerDaos
+from .mpi import DataStoreMPI, ServerManagerMPI
 
 # Main exports - wrapper classes provide the primary API
 __all__ = [
@@ -73,4 +74,6 @@ __all__ = [
     "ServerManagerDragon",
     "DataStoreDaos",
     "ServerManagerDaos",
+    "DataStoreMPI",
+    "ServerManagerMPI",
 ]
