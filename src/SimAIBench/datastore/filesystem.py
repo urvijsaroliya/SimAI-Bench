@@ -55,7 +55,8 @@ class DataStoreFilesystem(BaseDataStore):
     def _setup_client(self):
         """Setup filesystem client - create directory structure."""
         if self.config["type"] == "node-local":
-            if "server_address" not in self.config or not self.config["server_address"].startswith("/tmp"):
+            # Honour a configured address; default to /tmp only when none is given.
+            if not self.config.get("server_address"):
                 self.config["server_address"] = "/tmp"
         elif self.config["type"] == "filesystem":
             if "server_address" not in self.config:
