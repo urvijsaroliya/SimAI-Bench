@@ -133,6 +133,18 @@ class DataStoreMPI(BaseDataStore):
         self.key_rank_field = int(self.config.get("key_rank_field", 1))
         # Seconds a producer may stall on a full send window before saying so.
         self.stall_warn_s = float(self.config.get("stall_warn_s", 30.0))
+        # How a producer waits for a send slot once the window is full:
+        # "backoff" (default, unchanged) spins 200 times then sleeps 10 us -> 1 ms;
+        # "spin" never sleeps. An ENVIRONMENT variable and not a config key
+        # because the caller that needs it is an sbatch cell asking the same
+        # driver to run twice, and because it belongs in every result's
+        # platform.env beside the allocator knobs. See stage_data's loop.
+        self._slot_wait = (os.environ.get("SIMAI_MPI_SLOT_WAIT") or "backoff").lower()
+        if self._slot_wait not in ("backoff", "spin"):
+            raise ValueError(
+                f"SIMAI_MPI_SLOT_WAIT must be 'backoff' or 'spin', not "
+                f"{self._slot_wait!r}: a misspelling would otherwise read as the "
+                f"default and the run would silently be the control again.")
         # Opt-in because it is collective; see _setup_client.
         self.verify_peers = bool(self.config.get("verify_peers", False))
         # Seconds clean() will wait for in-flight sends before cancelling them.
@@ -390,7 +402,14 @@ class DataStoreMPI(BaseDataStore):
             # (0.051 -> 0.259 ms per 1 MB read, bisected in job 1619893).
             # Spin first so the common short wait pays nothing, then grow the
             # interval, since a stall worth warning about lasts seconds.
-            if spins < 200:
+            # SIMAI_MPI_SLOT_WAIT=spin removes the sleep entirely and leaves the
+            # spin plus _reap(). It exists for one experiment: the producer's
+            # realised compute clock under gating is 2.5x its free one on Fritz
+            # (M23), and "the producer idled, so it resumes cold" is the last
+            # candidate mechanism left standing. That sleep is the only idling
+            # a gated producer does, and it lives here rather than in the
+            # driver, so --poll-sleep cannot reach it. Default is unchanged.
+            if spins < 200 or self._slot_wait == "spin":
                 spins += 1
             else:
                 time.sleep(min(1e-5 * 2 ** ((spins - 200) // 50), 1e-3))
