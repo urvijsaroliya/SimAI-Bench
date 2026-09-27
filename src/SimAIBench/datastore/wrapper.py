@@ -14,6 +14,7 @@ from .filesystem import DataStoreFilesystem, ServerManagerFilesystem
 from .redis import DataStoreRedis, ServerManagerRedis
 from .dragon import DataStoreDragon, ServerManagerDragon
 from .daos import DataStoreDaos, ServerManagerDaos
+from .rma import DataStoreRMA, ServerManagerRMA
 from SimAIBench.config import ServerConfig
 
 
@@ -25,6 +26,7 @@ DATASTORE_BACKENDS = {
     "redis": DataStoreRedis,
     "dragon": DataStoreDragon,
     "daos": DataStoreDaos,
+    "rma": DataStoreRMA,     # one-sided ring queue, no store
 }
 
 SERVERMANAGER_BACKENDS = {
@@ -33,6 +35,7 @@ SERVERMANAGER_BACKENDS = {
     "redis": ServerManagerRedis,
     "dragon": ServerManagerDragon,
     "daos": ServerManagerDaos,
+    "rma": ServerManagerRMA,
 }
 
 
