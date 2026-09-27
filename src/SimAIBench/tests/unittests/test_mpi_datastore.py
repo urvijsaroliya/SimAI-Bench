@@ -360,15 +360,23 @@ def test_tags_distinct(comm, rank):
         ds._tag(k)              # raises on collision; registry lives in ds
     assert len(ds._tags) == len(set(keys)), "registry lost a key"
 
-    # A collision must raise, not be silently matched. Two keys sharing a tag
-    # are undetectable at the receiver: Recv matches on (source, tag) alone and
-    # would hand back the other message's payload. Plant one and check.
+    # Two producers may share a tag for the same window index - Recv matches on
+    # (source, tag), and those are different messages because the source differs.
+    # This is what the structured tag relies on, and what the hash could not give:
+    # on Fritz jobs 4270717 and 4270897 'input_1_98_<run tag>' and
+    # 'input_2_87_<run tag>' hashed to the same 20-bit tag and cost three cells.
+    assert ds._tag("input_1_98") == ds._tag("input_2_98"), "index tag must not depend on the producer"
+    assert ds._tag("input_1_98") != ds._tag("input_1_87"), "two windows of one producer must differ"
+
+    # A collision must still raise, not be silently matched: within ONE source,
+    # two different keys sharing a tag are undetectable at the receiver. Plant
+    # one at the registry's own key, which is the (source, tag) pair.
     victim = f"input_{PRODUCER}_0"
-    ds._tags[ds._tag(victim)] = "some_other_key"
+    ds._tags[(ds._src(victim), ds._tag(victim))] = "some_other_key"
     try:
         ds._tag(victim)
     except ValueError as e:
-        assert "hash to tag" in str(e), e
+        assert "map to tag" in str(e), e
     else:
         raise AssertionError("collision not detected")
     comm.Barrier()

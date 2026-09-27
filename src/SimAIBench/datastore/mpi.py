@@ -241,15 +241,53 @@ class DataStoreMPI(BaseDataStore):
                 f"own config, so this corrupts data rather than raising.")
 
     # ---- key contract ----------------------------------------------------
+    # Tag from the key's STRUCTURE where the key has one, and only from its hash
+    # where it does not. A hash over a 2^20 tag space is a birthday problem in
+    # the number of live keys: at 1 100 keys (12 ranks x ~100 windows) the chance
+    # of a collision is ~44%, at 1 320 it is ~56%, and MPI_TAG_UB is 1048575 on
+    # Intel MPI, so the space cannot simply be widened. It fired on Fritz jobs
+    # 4270717 and 4270897 (fan-in, 11 sims): 'input_1_98_<tag>' and
+    # 'input_2_87_<tag>' both hashed to 825240, the guard below refused, and
+    # three cells were lost. Earlier fan-in runs at the same width had merely
+    # been lucky.
+    #   <prefix>_<rank>[_<index>][_<run tag>]  ->  PREFIX_SLOT * 65536 + index
+    # is collision-free over the keys the drivers use, because both ends compute
+    # it from the same string and the index is unique per (prefix, producer),
+    # which is what Recv matches on together with the source. A prefix the table
+    # does not know, or a key that does not parse, keeps the hash, and the guard
+    # still catches a collision between the two schemes.
+    _PREFIX_SLOT = {"input": 0, "weights": 1, "simdone": 2, "wdone": 3}
+    _IDX_SPAN = 1 << 16
+
     def _tag(self, key: str) -> int:
-        tag = zlib.crc32(key.encode()) % self._tag_mod
-        seen = self._tags.setdefault(tag, key)
+        tag = None
+        parts = key.split("_")
+        if len(parts) >= 2 and parts[1].isdigit():
+            slot = self._PREFIX_SLOT.get(parts[0])
+            if slot is not None:
+                idx = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+                cand = slot * self._IDX_SPAN + (idx % self._IDX_SPAN)
+                if cand < self._tag_mod:
+                    tag = cand
+        if tag is None:
+            tag = zlib.crc32(key.encode()) % self._tag_mod
+        # Guard on (source, tag), which is what Recv matches on: under the
+        # structured scheme every producer uses the same tag for its own window
+        # index, and those are different messages precisely because the source
+        # differs. Keying the guard on the tag alone would refuse every fan-in
+        # trainer reading the same index from two sims.
+        try:
+            src = self._src(key)
+        except Exception:
+            src = None
+        seen = self._tags.setdefault((src, tag), key)
         if seen != key:
             raise ValueError(
-                f"mpi backend: {key!r} and {seen!r} both hash to tag {tag}. "
-                f"Recv matches on (source, tag), so one would silently return "
-                f"the other's payload. Rename one key, or raise TAG_UB if the "
-                f"MPI allows it (tag space here is {self._tag_mod}).")
+                f"mpi backend: {key!r} and {seen!r} both map to tag {tag} from "
+                f"source {src}. Recv matches on (source, tag), so one would "
+                f"silently return the other's payload. Rename one key, or raise "
+                f"TAG_UB if the MPI allows it (tag space here is "
+                f"{self._tag_mod}).")
         return tag
 
     def _src(self, key: str) -> int:
