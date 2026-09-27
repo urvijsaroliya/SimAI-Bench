@@ -104,3 +104,108 @@ class DaosServerConfig(ServerConfig):
     server_address: str = "/path/to/dfuse/mount"
     mode: Literal["posix", "kv"] = "posix"
     nshards: int = 64
+
+
+@server_registry.register("rma")
+class RMAServerConfig(ServerConfig):
+    """Ring queue in MPI one-sided windows. No server; the windows are the transport.
+
+    One ring per (producer, consumer, class), single-producer single-consumer,
+    with HEAD/TAIL as uint64 atomics in the ring owner's control window. See
+    `datastore/rma.py` for the protocol and for which of these knobs the 2c
+    feasibility gate (job 4242310) fixed the default of.
+    """
+    type: Literal["rma"] = "rma"
+    server_address: str = "comm-world"  # unused; base class requires it
+
+    # A ticket queue addresses nobody, but the rings are still built from the
+    # declared topology: one per pair, so this is what gets allocated.
+    consumers: List[int] = Field(default_factory=list)
+
+    # A consumer sizes its Get from its own config before it has seen the record,
+    # so shape/shapes/dtype are a wire contract and are checked at setup.
+    shape: List[int] = Field(default_factory=lambda: [319488])
+    shapes: Dict[str, List[int]] = Field(default_factory=dict)
+    dtype: str = "float32"
+    bulk_prefixes: List[str] = Field(default_factory=lambda: ["input"])
+
+    # M_q, v3 section 15.5's explicit ring capacity, in slots. Unlike the direct
+    # path's max_outstanding this bounds the queue at EVERY payload size, not
+    # only above the rendezvous switch (7194 B within a node, 4111 B across it;
+    # F20 revised). drop_capacity: own depth for drop_prefixes; 0 = same.
+    capacity: int = 8
+    drop_capacity: int = 0
+    # A full ring blocks for lossless keys and drops the new record for these,
+    # exactly as the direct path does - blocking a keep-last-1 stream deadlocks a
+    # closed loop. v3 section 15.5: the ring has no native keep-last-1, so a
+    # consumer that wants only the newest version still drains to it.
+    drop_prefixes: List[str] = Field(default_factory=list)
+    # refused up front rather than failing inside MPI: window creation is IB
+    # memory registration on this build (M33 observation 3)
+    max_window_bytes: int = 1 << 30
+
+    # Which communicator the windows live on. "world" is the default because that
+    # is where a coupled job's windows actually live - and M33 is that a
+    # world-communicator window gets osc/ucx, which on this build has no
+    # shared-memory lane: an intra-node atomic costs 0.0120-0.0128 ms against
+    # osc/sm's 0.0038-0.0047. "node" (Split_type(COMM_TYPE_SHARED)) recovers most
+    # of that and can only carry pairs that share a node, so it is a control arm.
+    # The tiered arrangement is the author's open option and is not implemented.
+    ring_comm: Literal["world", "node"] = "world"
+    # Where the ring memory lives. "producer": the push is a local store (no RMA
+    # at all) and the pop is a remote Get the consumer can overlap - which is the
+    # only direction that overlaps within a node (M33). "consumer": the push is a
+    # Put and the pop is a local load, i.e. v3 section 15.8 (i)'s zero-copy pop,
+    # which the gate never timed.
+    ring_owner: Literal["producer", "consumer"] = "producer"
+    # compare-and-swap on TAIL asserts the ring really had one consumer; "faa" is
+    # the same operation without the assertion, for a cell that prices it
+    release_op: Literal["cas", "faa"] = "cas"
+    # "on": poll_staged_data checks the head record's key exactly (one small Get)
+    # so a poll for a key queued behind others answers honestly - every driver
+    # path depends on that. "off": one atomic, trust FIFO, key_mismatch counts
+    # when that trust was wrong.
+    peek: Literal["on", "off"] = "on"
+    # moves the payload Get from read_tot into poll_tot; for checking the
+    # attribution, not for a measured cell
+    fetch_on_poll: bool = False
+    # MPI_Win_sync after a local store (producer-owned rings) is the unified-model
+    # memory barrier that publishes the payload before the commit; "none" removes
+    # it and is only for pricing it
+    sync_mode: Literal["sync", "none"] = "sync"
+    # MPI_Win_allocate is collective, so a second store in one process must join
+    # the first one's windows. "singleton" refuses a second geometry rather than
+    # deadlocking (coupled.py builds a second store on the sim ranks only);
+    # "per-config" allocates per geometry and is for a harness where every rank
+    # builds the same sequence of stores.
+    windows: Literal["singleton", "per-config"] = "singleton"
+    # MPI_Win_free is collective too, and the driver leaves one store per sim rank
+    # uncleaned, so clean() ends the epoch and leaves the windows to Finalize
+    free_windows: bool = False
+    win_info: Dict[str, str] = Field(default_factory=dict)
+
+    # the key travels verbatim in the slot (no hash, so no collision class);
+    # control_max_bytes is the floor on a slot's payload for pickled messages
+    key_rank_field: int = 1
+    key_max_bytes: int = 64
+    control_max_bytes: int = 4096
+
+    # bounds: no wait here is unbounded
+    full_timeout_s: float = 300.0   # producer blocked on a full ring
+    stall_warn_s: float = 30.0
+    poll_max_pops: int = 64         # records one poll may drain into the read-ahead
+    # 0 = derive from this rank's consumed capacity (2x, min 16). A producer
+    # cannot run more than capacity records ahead, so that is the most that can
+    # sit in front of a key; a parked record is a whole payload, so it is a
+    # memory bound as well.
+    readahead_max: int = 0
+    cas_max_retries: int = 64
+    clean_drain_s: float = 5.0
+    spin_before_sleep: int = 200
+    sleep_max_s: float = 1e-3
+    closed_check_every: int = 64
+    # a sleeping producer may be a consumer's stall if an osc/ucx atomic needs
+    # progress on the target - the gate's untested question (v3 15.8 ii)
+    progress_poke: bool = True
+
+    device: Literal["cpu"] = "cpu"  # v1; OQ3 (CUDA-aware Put) is unanswered, not answered
