@@ -1622,6 +1622,39 @@ class DataStoreRMA(BaseDataStore):
         self.poll_misses += 1
         return False
 
+    def head_key(self, like_key: str):
+        """The key of the oldest record this consumer can still take, or None.
+
+        EXISTS FOR LAPPING, AND ONLY FOR IT. A consumer that polls for a NAMED
+        index - which is what `coupled.py`'s forward barrier does - cannot make
+        progress once the producer has lapped that index away: the record is gone,
+        the poll misses forever, and nothing in the ring's own accounting is wrong.
+        Dropping the oldest keeps the TICKET sequence contiguous, which is what
+        stops the read-ahead from parking and raising, but it does not put the KEY
+        back. So the ring has to be able to say where it now starts, and this is
+        that one question. The caller jumps its own counter to this key's index and
+        charges the difference to f_drop.
+
+        Returns None when the ring is empty, which is a miss and not an error: the
+        producer may simply not have written yet. `like_key` is any key naming the
+        source and prefix class to ask about - normally the one that just missed.
+        """
+        # `like_key` names the source and the prefix class, exactly as every other
+        # consumer-side entry point does: the ring is found by (src, self.rank,
+        # class), so the caller passes the key it was waiting for.
+        ring = self._ring_in(like_key)
+        if self.drop_mode == "oldest":
+            self._resync(ring)
+        self._read_head(ring)
+        if ring.committed <= ring.next_ticket:
+            return None
+        for _ in range(2):
+            try:
+                return self._peek_header(ring)
+            except _Lapped:
+                continue                # resynced; one retry is enough
+        return None
+
     def stage_read(self, key: str, client_id: int = 0, timeout: int = 30,
                    is_local: bool = False):
         """Pop `key`, draining records in front of it into the read-ahead dict."""

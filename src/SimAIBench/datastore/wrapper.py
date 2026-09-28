@@ -112,6 +112,22 @@ class DataStore:
         """Read staged data using the key."""
         return self._backend.stage_read(key, client_id, timeout, is_local)
     
+    def head_key(self, like_key: str):
+        """Oldest key this consumer can still take, or None. Ring backend only.
+
+        Delegated explicitly because this class has no `__getattr__`: a caller that
+        reached for it through `getattr(store, "head_key", None)` would get None on
+        the wrapper and silently skip the lap jump, which on a lapping ring means
+        waiting forever for a record that was overwritten.
+        """
+        fn = getattr(self._backend, "head_key", None)
+        if fn is None:
+            raise AttributeError(
+                "%s backend has no head_key: it is the ring's answer to 'where do "
+                "you start now', and only drop_mode='oldest' needs it."
+                % (type(self._backend).__name__,))
+        return fn(like_key)
+
     def poll_staged_data(self, key: str, client_id: int = 0, is_local: bool = False) -> bool:
         """Check if data for the key is staged."""
         return self._backend.poll_staged_data(key, client_id, is_local)
