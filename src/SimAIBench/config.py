@@ -181,6 +181,13 @@ class RMAServerConfig(ServerConfig):
     # closed loop. v3 section 15.5: the ring has no native keep-last-1, so a
     # consumer that wants only the newest version still drains to it.
     drop_prefixes: List[str] = Field(default_factory=list)
+    # What a full drop-class ring does. "newest" discards the arriving record and
+    # HOLES the index sequence, so it cannot serve a keep-last FORWARD path.
+    # "oldest" laps: the producer advances TAIL past the unread record, the
+    # sequence stays contiguous, and the consumer detects that it was lapped
+    # (`lap_skipped`, `lap_torn`). Lapping breaks the invariant that TAIL moves
+    # only after a payload has landed - that is what it is for - so it is opt-in.
+    drop_mode: Literal["newest", "oldest"] = "newest"
     # refused up front rather than failing inside MPI: window creation is IB
     # memory registration on this build (M33 observation 3)
     max_window_bytes: int = 1 << 30

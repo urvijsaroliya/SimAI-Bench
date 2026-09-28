@@ -264,6 +264,17 @@ HDR_WORDS = 8
 HDR_BYTES = HDR_WORDS * 8
 H_MAGIC, H_TICKET, H_KEYLEN, H_NBYTES, H_PRODUCER, H_KIND, H_ECHO, H_RSV = range(8)
 
+class _Lapped(Exception):
+    """The record this consumer was about to take was overwritten first.
+
+    Raised only under drop_mode="oldest", where the producer may advance TAIL past
+    an unread slot. It is a control-flow signal between the ring's own methods and
+    never escapes the backend: every caller either resyncs and retries or reports a
+    miss. A separate exception rather than a sentinel return because `_peek_header`
+    returns a key, and a sentinel key would be indistinguishable from a record.
+    """
+
+
 CTL_WORDS_PER_RING = 8      # padded to 64 B so two rings never share a cache line
 W_HEAD, W_TAIL, W_CLOSED = 0, 1, 2
 
@@ -398,6 +409,21 @@ class DataStoreRMA(BaseDataStore):
                        for k, v in (c.get("shapes", {}) or {}).items()}
         self.bulk_prefixes = tuple(c.get("bulk_prefixes", ["input"]))
         self.drop_prefixes = tuple(c.get("drop_prefixes", []))
+        # What a FULL drop-class ring does. "newest" discards the arriving record,
+        # which is mpi.py's behaviour and leaves a HOLE in the index sequence (see
+        # the module docstring: coupled.py refuses --forward-policy keep-last with
+        # it for that reason). "oldest" LAPS instead: the producer advances TAIL
+        # past the record the consumer has not read, so the sequence stays
+        # contiguous and a keep-last stream is servable. Lapping deliberately
+        # breaks the invariant _release documents - TAIL no longer moves only
+        # after a payload has landed - so the consumer must detect that it was
+        # lapped, and in this mode a ticket mismatch is an EVENT, not a tripwire.
+        self.drop_mode = str(c.get("drop_mode", "newest")).lower()
+        if self.drop_mode not in ("newest", "oldest"):
+            raise ValueError(
+                "rma backend: drop_mode must be 'newest' or 'oldest', not %r. A "
+                "misspelling would read as the default and the run would "
+                "silently measure the other policy." % (self.drop_mode,))
         self.key_rank_field = int(c.get("key_rank_field", 1))
         self.key_max_bytes = int(c.get("key_max_bytes", 64))
         self.control_max_bytes = int(c.get("control_max_bytes", 4096))
@@ -537,6 +563,12 @@ class DataStoreRMA(BaseDataStore):
         # correctness tripwires: any non-zero invalidates the run
         self.magic_mismatch = 0
         self.ticket_mismatch = 0
+        # lapping (drop_mode="oldest") - all zero in every other mode
+        self.lapped = 0             # records the producer overwrote unread
+        self.lap_skipped = 0        # tickets the consumer never delivered
+        self.lap_torn = 0           # payload Gets discarded because the slot moved
+        self.lap_cas_mismatch = 0   # TAIL CAS that lost the race, either side
+        self.lap_checks = 0         # post-Get header re-reads (lap mode only)
         self.size_mismatch = 0
         self.key_mismatch = 0
         # first-use costs, so memory registration stays visible
@@ -959,6 +991,45 @@ class DataStoreRMA(BaseDataStore):
         self._read_tail(ring)
         return ring.committed - ring.tail < ring.capacity
 
+    def _resync(self, ring: _Ring) -> int:
+        """Consumer: skip forward to TAIL after the producer lapped us.
+
+        Returns the number of tickets given up. `commits == pops + lap_skipped`
+        is the identity the correctness ledger checks in this mode, in place of
+        `commits == pops`: a lapped record is gone, and it is counted here or it
+        is lost silently.
+        """
+        self._read_tail(ring)
+        skipped = ring.tail - ring.next_ticket
+        if skipped <= 0:
+            return 0
+        self.lap_skipped += skipped
+        ring.next_ticket = ring.tail
+        ring.peek_ticket = -1
+        ring.peek_key = None
+        return skipped
+
+    def _lap_one(self, ring: _Ring) -> bool:
+        """Free one slot by discarding the OLDEST unread record. Lap mode only.
+
+        The producer advances TAIL, which is the consumer's word everywhere else.
+        It is a CAS and not a SUM so the race with a concurrent `_release` is
+        decided rather than silently doubled: if the consumer released the same
+        record first, the CAS fails, TAIL has already moved, and there is now a
+        slot without anything being discarded. A SUM would advance TAIL twice and
+        lose a record that nothing counted.
+        """
+        expect = ring.tail
+        found = self._cas(ring, W_TAIL, expect, expect + 1)
+        if found == expect:
+            ring.tail = expect + 1
+            self.lapped += 1
+            return True
+        # the consumer got there first: re-read and let the caller re-test
+        self.lap_cas_mismatch += 1
+        ring.tail = found
+        return False
+
     def _block_for_slot(self, ring: _Ring, key: str):
         """Bounded wait for `HEAD - TAIL < capacity`, or raise.
 
@@ -1126,7 +1197,26 @@ class DataStoreRMA(BaseDataStore):
             # this ring. A publish is dropped for EVERY consumer at once, so
             # `dropped` counts publishes and coupled.py's wdone arithmetic
             # (wversion - w_dropped) stays exact per consumer.
-            if not all(self._has_slot(r) for r in rings):
+            if self.drop_mode == "oldest":
+                # Lap: make room in every ring that needs it, then write. A
+                # publish is never lost as a whole here - what is lost is the
+                # OLDEST record in each ring that was full, which is the policy
+                # keep-last means and the reason the index stays contiguous.
+                for ring in rings:
+                    guard = 0
+                    while not self._has_slot(ring):
+                        if not self._lap_one(ring):
+                            continue        # consumer released; re-test
+                        guard += 1
+                        if guard > ring.capacity + 1:
+                            raise RuntimeError(
+                                "rma backend: lapped %d records on ring %d -> %d "
+                                "of capacity %d without freeing a slot. TAIL is "
+                                "not advancing, which means the control word is "
+                                "not the one this rank thinks it is."
+                                % (guard, ring.producer, ring.consumer,
+                                   ring.capacity))
+            elif not all(self._has_slot(r) for r in rings):
                 self.dropped += 1
                 return
         else:
@@ -1219,6 +1309,15 @@ class DataStoreRMA(BaseDataStore):
                 "two ends disagree about the geometry."
                 % (t, ring.producer, ring.consumer, int(hdr[H_MAGIC]), MAGIC))
         if int(hdr[H_TICKET]) != t or int(hdr[H_ECHO]) != t:
+            if self.drop_mode == "oldest":
+                # EXPECTED HERE, AND ONLY HERE. Lapping is what this mode does, so
+                # the slot carrying someone else's ticket means the producer got to
+                # it first. Not a tripwire: resync to TAIL, count what was given
+                # up, and let the caller retry. ticket_mismatch stays a tripwire in
+                # every other mode, which is the whole reason this branch is
+                # conditioned on the mode rather than on the symptom.
+                self._resync(ring)
+                raise _Lapped(t)
             self.ticket_mismatch += 1
             raise RuntimeError(
                 "rma backend: slot for ticket %d of ring %d -> %d carries "
@@ -1301,6 +1400,20 @@ class DataStoreRMA(BaseDataStore):
         t0 = time.perf_counter()
         if self.release_op == "cas":
             found = self._cas(ring, W_TAIL, t, t + 1)
+            if found != t and self.drop_mode == "oldest":
+                # The producer advanced TAIL past this record while we were
+                # reading it. In this mode that is the policy, not a second
+                # consumer, so it is counted and resynced instead of raised - the
+                # assertion below would otherwise fire on every lap and report a
+                # topology error that is not there.
+                self.lap_cas_mismatch += 1
+                ring.tail = found
+                self._resync(ring)
+                self.release_s += time.perf_counter() - t0
+                self.releases += 1
+                ring.peek_ticket = -1
+                ring.peek_key = None
+                return
             tries = 0
             while found != t:
                 # a single-consumer ring makes this unreachable, which is why it
@@ -1326,13 +1439,88 @@ class DataStoreRMA(BaseDataStore):
         ring.peek_ticket = -1
         ring.peek_key = None
 
+    def _slot_still_ours(self, ring: _Ring, t: int) -> bool:
+        """Lap mode: does slot `t` still carry ticket `t` after the payload Get?
+
+        `_release` documents why TAIL moves only after a payload has landed: it is
+        what stops the producer overwriting a slot with a Get in flight. Lapping
+        removes that guarantee on purpose, so the bytes just read may be half of
+        one record and half of the next. The header's ECHO word is what makes that
+        detectable - it is written at the END of the header, so a slot being
+        rewritten shows ticket != echo or a ticket that is not ours - and this is
+        the check that turns an undetectable torn read into a counted one.
+
+        WHY THIS CANNOT MISS A TEAR. Tickets increase monotonically, so a slot that
+        was overwritten carries a ticket > t for the rest of the run: there is no
+        sequence of writes that takes it back to t and hides the overwrite. The
+        check can therefore only err the safe way - the producer may overwrite the
+        slot after our payload Get completed and before this re-read, and we then
+        discard a record that was in fact intact (counted in `lap_torn`). A false
+        alarm costs one record in a mode whose whole purpose is dropping records;
+        a missed tear would hand the caller two half-records spliced together.
+        """
+        self.lap_checks += 1
+        if self.ring_owner == "consumer":
+            if self.sync_mode == "sync":
+                self.win_pl.Sync()
+                self.sync_calls += 1
+            off = ring.slot_offset(t)
+            raw = self._pl_u8[off:off + self.payload_offset]
+        else:
+            buf = self._peek_buf[ring.rid]
+            tgt = self._target(ring.owner)
+            self.win_pl.Get(buf, tgt, ring.slot_offset(t))
+            self.win_pl.Flush(tgt)
+            raw = buf
+        hdr = raw[:HDR_BYTES].view(np.uint64)
+        ring.peek_ticket = -1           # the buffer no longer describes the peek
+        ring.peek_key = None
+        return int(hdr[H_TICKET]) == t and int(hdr[H_ECHO]) == t
+
     def _pop_one(self, ring: _Ring):
-        """Peek, fetch, release. Returns (key, object)."""
-        key = self._peek_header(ring)
-        obj = self._fetch_payload(ring, key)
-        self._release(ring)
-        self.pops += 1
-        return key, obj
+        """Peek, fetch, release. Returns (key, object).
+
+        Under drop_mode="oldest" this may find that the record it claimed was
+        overwritten - either before the header Get (`_Lapped` out of
+        `_peek_header`) or during the payload Get (the tear check below). Both are
+        retried from the resynced TAIL, bounded by the ring's capacity: a producer
+        cannot lap more than `capacity` records without the consumer making
+        progress, so more retries than that is a stuck TAIL and not contention.
+        """
+        if self.drop_mode != "oldest":
+            key = self._peek_header(ring)
+            obj = self._fetch_payload(ring, key)
+            self._release(ring)
+            self.pops += 1
+            return key, obj
+
+        for _ in range(ring.capacity + 2):
+            try:
+                t = ring.next_ticket
+                key = self._peek_header(ring)
+                obj = self._fetch_payload(ring, key)
+            except _Lapped:
+                continue                # _peek_header already resynced
+            if not self._slot_still_ours(ring, t):
+                # the payload is a mix of two records; the one we claimed is gone
+                self.lap_torn += 1
+                self.lap_skipped += 1
+                self._resync(ring)
+                if ring.next_ticket <= t:
+                    # TAIL had not passed us yet, so nothing resynced: step over
+                    # the record ourselves rather than re-reading the same torn slot
+                    ring.next_ticket = t + 1
+                continue
+            self._release(ring)
+            self.pops += 1
+            return key, obj
+        raise RuntimeError(
+            "rma backend: ring %d -> %d could not deliver a record in %d attempts "
+            "under drop_mode='oldest' (head %d tail %d next %d, capacity %d). The "
+            "producer cannot lap more than capacity records while the consumer "
+            "makes progress, so TAIL is not where this rank thinks it is."
+            % (ring.producer, ring.consumer, ring.capacity + 2, ring.committed,
+               ring.tail, ring.next_ticket, ring.capacity))
 
     def _park(self, key: str, obj):
         if len(self._readahead) >= self.readahead_max:
@@ -1411,7 +1599,12 @@ class DataStoreRMA(BaseDataStore):
             if self.peek == "off":
                 self.poll_hits += 1
                 return True
-            if self._peek_header(ring) == key:
+            try:
+                _peeked_is_key = self._peek_header(ring) == key
+            except _Lapped:
+                # resynced inside _peek_header; this pass found nothing to take
+                continue
+            if _peeked_is_key:
                 if self.fetch_on_poll:
                     # moves the payload Get from read_tot to poll_tot; exists so
                     # the analysis can check that attribution, not as a default
@@ -1634,6 +1827,13 @@ class DataStoreRMA(BaseDataStore):
             "size_mismatch": self.size_mismatch,
             "cas_mismatch": self.cas_mismatch,
             "key_mismatch": self.key_mismatch,
+            # lapping (drop_mode="oldest"); all zero otherwise
+            "drop_mode": self.drop_mode,
+            "lapped": self.lapped,
+            "lap_skipped": self.lap_skipped,
+            "lap_torn": self.lap_torn,
+            "lap_cas_mismatch": self.lap_cas_mismatch,
+            "lap_checks": self.lap_checks,
             "clean_unreleased": self.clean_unreleased,
             "unread_records": self.unread_records,
         }
